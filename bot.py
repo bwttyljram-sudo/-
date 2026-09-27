@@ -1,936 +1,623 @@
-"""
-VONE — بوت تيليجرام لتحويل النص إلى صوت (Microsoft Edge TTS) وتحويل الصوت إلى نص (faster-whisper).
-
-المميزات:
-- اشتراك إجباري بالقناة قبل الاستخدام.
-- تحويل نص → صوت بأصوات عربية (Microsoft Edge TTS)، مع قائمة أصوات ومفضلة.
-- تحويل صوت → نص (faster-whisper، يعمل محلياً على السيرفر بدون أي خدمة خارجية).
-- أوامر أدمن: إحصائيات حيّة + إذاعة جماعية بطيئة وآمنة.
-- حماية: حدود تزامن + تهدئة لكل مستخدم + حدود على طول النص ومدة الصوت.
-"""
-
-import os
-import io
-import time
+import subprocess
+import sys
 import asyncio
 import logging
-import sqlite3
+import os
+import uuid
 import threading
-from contextlib import contextmanager
-
-import edge_tts
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatMemberStatus, ChatAction, ParseMode
-from telegram.error import Forbidden, BadRequest
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 )
 
-from server import run_server
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger("vone_bot")
-
-
-# ====================================================================
-# 1) الإعدادات
-# ====================================================================
-
-class config:
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "6043858925"))
-    CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@ZenoX_Tools").strip()
-    CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/ZenoX_Tools").strip()
-    PORT = int(os.environ.get("PORT", "10000"))
-    DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
-
-    MAX_CONCURRENT_TTS = 5
-    PER_USER_COOLDOWN_SECONDS = 3
-    MAX_TEXT_LENGTH = 2000
-    BROADCAST_DELAY_SECONDS = 0.05
-    VOICES_PER_PAGE = 10
-    ACTIVE_NOW_WINDOW_MINUTES = 5
-
-    # تحويل الصوت إلى نص
-    MAX_CONCURRENT_STT = 1
-    STT_COOLDOWN_SECONDS = 5
-    STT_MODEL_SIZE = "base"
-    MAX_AUDIO_DURATION_SECONDS = 180
-
-
-# ====================================================================
-# 2) الأصوات العربية المتوفّرة من Microsoft Edge TTS
-# ====================================================================
-
-VOICES = [
-    {"id": "ar-SA-HamedNeural",   "name": "حامد (السعودية)",   "emoji": "🧔🏻"},
-    {"id": "ar-SA-ZariyahNeural", "name": "زارية (السعودية)",  "emoji": "👩🏻‍🦳"},
-    {"id": "ar-EG-ShakirNeural",  "name": "شاكر (مصر)",        "emoji": "🧔🏻"},
-    {"id": "ar-EG-SalmaNeural",   "name": "سلمى (مصر)",        "emoji": "👩🏻‍🦳"},
-    {"id": "ar-AE-HamdanNeural",  "name": "حمدان (الإمارات)",   "emoji": "🧔🏻"},
-    {"id": "ar-AE-FatimaNeural",  "name": "فاطمة (الإمارات)",   "emoji": "👩🏻‍🦳"},
-    {"id": "ar-BH-AliNeural",     "name": "علي (البحرين)",      "emoji": "🧔🏻"},
-    {"id": "ar-BH-LailaNeural",   "name": "ليلى (البحرين)",     "emoji": "👩🏻‍🦳"},
-    {"id": "ar-DZ-IsmaelNeural",  "name": "إسماعيل (الجزائر)",  "emoji": "🧔🏻"},
-    {"id": "ar-DZ-AminaNeural",   "name": "أمينة (الجزائر)",    "emoji": "👩🏻‍🦳"},
-    {"id": "ar-IQ-BasselNeural",  "name": "باسل (العراق)",      "emoji": "🧔🏻"},
-    {"id": "ar-IQ-RanaNeural",    "name": "رنا (العراق)",       "emoji": "👩🏻‍🦳"},
-    {"id": "ar-JO-TaimNeural",    "name": "طيم (الأردن)",       "emoji": "🧔🏻"},
-    {"id": "ar-JO-SanaNeural",    "name": "سناء (الأردن)",      "emoji": "👩🏻‍🦳"},
-    {"id": "ar-KW-FahedNeural",   "name": "فهد (الكويت)",       "emoji": "🧔🏻"},
-    {"id": "ar-KW-NouraNeural",   "name": "نورة (الكويت)",      "emoji": "👩🏻‍🦳"},
-    {"id": "ar-LB-RamiNeural",    "name": "رامي (لبنان)",       "emoji": "🧔🏻"},
-    {"id": "ar-LB-LaylaNeural",   "name": "ليلى (لبنان)",       "emoji": "👩🏻‍🦳"},
-    {"id": "ar-LY-OmarNeural",    "name": "عمر (ليبيا)",        "emoji": "🧔🏻"},
-    {"id": "ar-LY-ImanNeural",    "name": "إيمان (ليبيا)",      "emoji": "👩🏻‍🦳"},
-    {"id": "ar-MA-JamalNeural",   "name": "جمال (المغرب)",      "emoji": "🧔🏻"},
-    {"id": "ar-MA-MounaNeural",   "name": "منى (المغرب)",       "emoji": "👩🏻‍🦳"},
-    {"id": "ar-OM-AbdullahNeural","name": "عبدالله (عُمان)",    "emoji": "🧔🏻"},
-    {"id": "ar-OM-AyshaNeural",   "name": "عائشة (عُمان)",      "emoji": "👩🏻‍🦳"},
-    {"id": "ar-QA-MoazNeural",    "name": "معاذ (قطر)",         "emoji": "🧔🏻"},
-    {"id": "ar-QA-AmalNeural",    "name": "أمل (قطر)",          "emoji": "👩🏻‍🦳"},
-    {"id": "ar-SY-LaithNeural",   "name": "ليث (سوريا)",        "emoji": "🧔🏻"},
-    {"id": "ar-SY-AmanyNeural",   "name": "أماني (سوريا)",      "emoji": "👩🏻‍🦳"},
-    {"id": "ar-TN-HediNeural",    "name": "هادي (تونس)",        "emoji": "🧔🏻"},
-    {"id": "ar-TN-ReemNeural",    "name": "ريم (تونس)",         "emoji": "👩🏻‍🦳"},
-    {"id": "ar-YE-SalehNeural",   "name": "صالح (اليمن)",       "emoji": "🧔🏻"},
-    {"id": "ar-YE-MaryamNeural",  "name": "مريم (اليمن)",       "emoji": "👩🏻‍🦳"},
-]
-
-VOICES_BY_ID = {v["id"]: v for v in VOICES}
-
-
-def get_voice(voice_id: str):
-    return VOICES_BY_ID.get(voice_id)
-
-
-# ====================================================================
-# 3) قاعدة البيانات
-# ====================================================================
-
-_db_lock = threading.Lock()
-
-
-def _db_connect():
-    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
-@contextmanager
-def _get_conn():
-    with _db_lock:
-        conn = _db_connect()
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-
-class db:
-    @staticmethod
-    def init_db():
-        with _get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    language_code TEXT,
-                    joined_at REAL,
-                    last_active REAL,
-                    selected_voice TEXT,
-                    is_subscribed INTEGER DEFAULT 0,
-                    awaiting_stt INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    user_id INTEGER,
-                    voice_id TEXT,
-                    PRIMARY KEY (user_id, voice_id)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    created_at REAL,
-                    success INTEGER
-                )
-            """)
-            # ترقية آمنة لقاعدة بيانات قديمة (لو كانت موجودة قبل هالعمود)
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
-            if "awaiting_stt" not in cols:
-                conn.execute("ALTER TABLE users ADD COLUMN awaiting_stt INTEGER DEFAULT 0")
-
-    # ---------------- المستخدمون ----------------
-
-    @staticmethod
-    def upsert_user(user_id: int, username: str, language_code: str):
-        now = time.time()
-        with _get_conn() as conn:
-            cur = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-            exists = cur.fetchone() is not None
-            if exists:
-                conn.execute(
-                    "UPDATE users SET username=?, language_code=?, last_active=? WHERE user_id=?",
-                    (username, language_code, now, user_id),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO users (user_id, username, language_code, joined_at, last_active, selected_voice) "
-                    "VALUES (?, ?, ?, ?, ?, NULL)",
-                    (user_id, username, language_code, now, now),
-                )
-        return not exists
-
-    @staticmethod
-    def touch_user(user_id: int):
-        with _get_conn() as conn:
-            conn.execute("UPDATE users SET last_active=? WHERE user_id=?", (time.time(), user_id))
-
-    @staticmethod
-    def set_selected_voice(user_id: int, voice_id: str):
-        with _get_conn() as conn:
-            conn.execute("UPDATE users SET selected_voice=? WHERE user_id=?", (voice_id, user_id))
-
-    @staticmethod
-    def get_selected_voice(user_id: int):
-        with _get_conn() as conn:
-            cur = conn.execute("SELECT selected_voice FROM users WHERE user_id=?", (user_id,))
-            row = cur.fetchone()
-            return row[0] if row else None
-
-    @staticmethod
-    def set_subscribed(user_id: int, subscribed: bool):
-        with _get_conn() as conn:
-            conn.execute(
-                "UPDATE users SET is_subscribed=? WHERE user_id=?",
-                (1 if subscribed else 0, user_id),
-            )
-
-    @staticmethod
-    def set_stt_mode(user_id: int, enabled: bool):
-        with _get_conn() as conn:
-            conn.execute(
-                "UPDATE users SET awaiting_stt=? WHERE user_id=?",
-                (1 if enabled else 0, user_id),
-            )
-
-    @staticmethod
-    def is_awaiting_stt(user_id: int) -> bool:
-        with _get_conn() as conn:
-            cur = conn.execute("SELECT awaiting_stt FROM users WHERE user_id=?", (user_id,))
-            row = cur.fetchone()
-            return bool(row and row[0])
-
-    @staticmethod
-    def get_all_user_ids():
-        with _get_conn() as conn:
-            cur = conn.execute("SELECT user_id FROM users")
-            return [r[0] for r in cur.fetchall()]
-
-    @staticmethod
-    def remove_user(user_id: int):
-        with _get_conn() as conn:
-            conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-            conn.execute("DELETE FROM favorites WHERE user_id=?", (user_id,))
-
-    # ---------------- المفضلة ----------------
-
-    @staticmethod
-    def toggle_favorite(user_id: int, voice_id: str) -> bool:
-        with _get_conn() as conn:
-            cur = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
-            )
-            if cur.fetchone():
-                conn.execute(
-                    "DELETE FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
-                )
-                return False
-            else:
-                conn.execute(
-                    "INSERT INTO favorites (user_id, voice_id) VALUES (?, ?)", (user_id, voice_id)
-                )
-                return True
-
-    @staticmethod
-    def get_favorites(user_id: int):
-        with _get_conn() as conn:
-            cur = conn.execute("SELECT voice_id FROM favorites WHERE user_id=?", (user_id,))
-            return [r[0] for r in cur.fetchall()]
-
-    @staticmethod
-    def is_favorite(user_id: int, voice_id: str) -> bool:
-        with _get_conn() as conn:
-            cur = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
-            )
-            return cur.fetchone() is not None
-
-    # ---------------- سجل الطلبات والإحصائيات ----------------
-
-    @staticmethod
-    def log_request(user_id: int, success: bool):
-        with _get_conn() as conn:
-            conn.execute(
-                "INSERT INTO requests (user_id, created_at, success) VALUES (?, ?, ?)",
-                (user_id, time.time(), 1 if success else 0),
-            )
-
-    @staticmethod
-    def get_stats():
-        now = time.time()
-        day = 86400
-        with _get_conn() as conn:
-            total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
-            active_now = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE last_active >= ?",
-                (now - config.ACTIVE_NOW_WINDOW_MINUTES * 60,),
-            ).fetchone()[0]
-
-            active_7d = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE last_active >= ?", (now - 7 * day,)
-            ).fetchone()[0]
-
-            active_30d = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE last_active >= ?", (now - 30 * day,)
-            ).fetchone()[0]
-
-            subscribed_count = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE is_subscribed=1"
-            ).fetchone()[0]
-
-            total_requests = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-            success_requests = conn.execute(
-                "SELECT COUNT(*) FROM requests WHERE success=1"
-            ).fetchone()[0]
-            success_rate = (success_requests / total_requests * 100) if total_requests else 100.0
-
-            lang_rows = conn.execute(
-                "SELECT language_code, COUNT(*) c FROM users "
-                "WHERE language_code IS NOT NULL GROUP BY language_code ORDER BY c DESC LIMIT 5"
-            ).fetchall()
-            top_languages = [(row[0] or "غير معروف", row[1]) for row in lang_rows]
-
-        return {
-            "total_users": total_users,
-            "active_now": active_now,
-            "active_7d": active_7d,
-            "active_30d": active_30d,
-            "subscribed_count": subscribed_count,
-            "total_requests": total_requests,
-            "success_rate": success_rate,
-            "top_languages": top_languages,
-        }
-
-
-# ====================================================================
-# 4) الأزرار (Inline Keyboards)
-# ====================================================================
-
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("تحويل النص إلى صوت🔊", callback_data="menu_tts", style="primary")],
-        [InlineKeyboardButton("تحويل الصوت إلى نص 📝", callback_data="menu_stt", style="success")],
-    ])
-
-
-def tts_submenu_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices", style="primary"),
-            InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav", style="primary"),
-        ],
-        [InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")],
-    ])
-
-
-def subscribe_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("أشترك في القناة 📺", url=config.CHANNEL_LINK, style="danger")],
-        [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="primary")],
-    ])
-
-
-def back_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")],
-    ])
-
-
-def _paginate(items, page):
-    start = page * config.VOICES_PER_PAGE
-    end = start + config.VOICES_PER_PAGE
-    return items[start:end], len(items)
-
-
-def voices_list_keyboard(page: int, favorites: set):
-    page_items, total = _paginate(VOICES, page)
-    rows = []
-    for v in page_items:
-        is_fav = v["id"] in favorites
-        heart = "💙" if is_fav else "🤍"
-        rows.append([
-            InlineKeyboardButton(
-                f"{v['emoji']} {v['name']}", callback_data=f"vsel:list:{page}:{v['id']}"
-            ),
-            InlineKeyboardButton(
-                heart, callback_data=f"vtog:list:{page}:{v['id']}"
-            ),
-        ])
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("« السابق", callback_data=f"vlist:{page - 1}"))
-    if (page + 1) * config.VOICES_PER_PAGE < total:
-        nav_row.append(InlineKeyboardButton("التالي »", callback_data=f"vlist:{page + 1}"))
-    if nav_row:
-        rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def favorites_list_keyboard(page: int, favorite_voice_ids: list):
-    fav_voices = [v for v in VOICES if v["id"] in favorite_voice_ids]
-    page_items, total = _paginate(fav_voices, page)
-    rows = []
-    for v in page_items:
-        rows.append([
-            InlineKeyboardButton(
-                f"{v['emoji']} {v['name']} 💙", callback_data=f"vsel:fav:{page}:{v['id']}"
-            ),
-            InlineKeyboardButton("✖️", callback_data=f"vtog:fav:{page}:{v['id']}"),
-        ])
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("« السابق", callback_data=f"vfav:{page - 1}"))
-    if (page + 1) * config.VOICES_PER_PAGE < total:
-        nav_row.append(InlineKeyboardButton("التالي »", callback_data=f"vfav:{page + 1}"))
-    if nav_row:
-        rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def stats_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("تحديث 🔄", callback_data="admin_stats_refresh", style="primary")],
-    ])
-
-
-# ====================================================================
-# 5) منطق البوت
-# ====================================================================
-
-tts_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TTS)
-stt_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_STT)
-_last_request_time = {}
-_last_stt_time = {}
-
-_stt_model = None  # يُحمَّل عند أول استخدام فقط (كسول)
-
-
-async def is_subscribed(bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=config.CHANNEL_USERNAME, user_id=user_id)
-        subscribed = member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
-    except BadRequest as e:
-        logger.warning("تعذّر التحقق من الاشتراك للمستخدم %s: %s", user_id, e)
-        subscribed = False
-    except Exception as e:
-        logger.warning("خطأ غير متوقع أثناء التحقق من الاشتراك: %s", e)
-        subscribed = False
-
-    db.set_subscribed(user_id, subscribed)
-    return subscribed
-
-
-def welcome_text(name: str) -> str:
-    return (
-        f"مرحبا بك مجدداً يا {name} في بوت VONE\n\n"
-        "ما الذي يقدمة بوت VONE:❔\n\n"
-        "- يمكنك تحويل النصوص\n"
-        "- الى أصوات واضحة وفي\n"
-        "- نفس الوقت يمكنك تحويل\n"
-        "- الملفات الصوتية إلى نصوص.\n\n"
-        "إختر الخدمة المُناسبة من الأزرار أدناه 👇🏻"
+# تحديث تلقائي لمكتبة yt-dlp مع curl_cffi (انتحال بصمة المتصفح - ضروري لتيك توك)
+try:
+    print("🔄 جاري التحقق من تحديثات yt-dlp...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]"],
+        capture_output=True, text=True
     )
-
-
-def force_sub_text(name: str) -> str:
-    return (
-        f"مرحباً بك يا {name} في بوت VONE\n\n"
-        "🚧 يجب عليك إكمال الخطوات التالية!:\n\n"
-        "- أنضم الى قناة البوت اولا 📺\n"
-        "- أضغط على زر التحقق 🔍\n"
-        "- أرسل أمر /start للبدء ⚙️"
-    )
-
-
-SEP = "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖"
-
-
-def build_stats_text(stats: dict) -> str:
-    lines = [
-        "📊 <b>لوحة إحصائيات بوت VONE</b>",
-        SEP,
-        "",
-        "👥 <b>المستخدمون</b>",
-        f"🟢 نشطون الآن: <b>{stats['active_now']}</b>",
-        f"👤 إجمالي المستخدمين: <b>{stats['total_users']}</b>",
-        f"📈 نشطون آخر 7 أيام: <b>{stats['active_7d']}</b>",
-        f"📈 نشطون آخر 30 يوم: <b>{stats['active_30d']}</b>",
-        f"📺 مشتركون بالقناة (آخر تحقق): <b>{stats['subscribed_count']}</b>",
-        "",
-        SEP,
-        "",
-        "🌍 <b>أبرز اللغات لدى المستخدمين</b>",
-    ]
-    if stats["top_languages"]:
-        total = stats["total_users"] or 1
-        for lang, count in stats["top_languages"]:
-            pct = count / total * 100
-            lines.append(f"▫️ {lang}: <b>{count}</b> ({pct:.1f}%)")
+    if result.returncode == 0:
+        print("✅ yt-dlp محدث لأحدث إصدار!")
     else:
-        lines.append("▫️ لا توجد بيانات كافية بعد")
+        print("❌ فشل تثبيت yt-dlp[default,curl-cffi] فعلياً! الخطأ الحقيقي:")
+        print(result.stderr[-3000:])
+except Exception as e:
+    print(f"⚠️ فشل التحديث التلقائي: {e}")
 
-    lines += [
-        "",
-        SEP,
-        "",
-        "📨 <b>الطلبات</b>",
-        f"📥 إجمالي الطلبات: <b>{stats['total_requests']}</b>",
-        f"✅ نسبة نجاح البوت: <b>{stats['success_rate']:.1f}%</b>",
-        "",
-        SEP,
-        "",
-        "ℹ️ لغة المستخدم تُستخدم كأقرب تقريب متاح بدل الدولة الفعلية"
-        " (تيليجرام لا يوفّر بيانات دولة حقيقية عبر الـ API).",
-        "",
-        f"🕒 آخر تحديث: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
-    ]
-    return "\n".join(lines)
+from yt_dlp import YoutubeDL
 
+try:
+    import importlib.metadata as _im
+    print(f"📦 نسخة yt-dlp: {_im.version('yt-dlp')}")
+except Exception as e:
+    print(f"⚠️ تعذر قراءة نسخة yt-dlp: {e}")
+try:
+    print(f"📦 نسخة curl_cffi: {_im.version('curl_cffi')} - (انتحال بصمة المتصفح لتيك توك)")
+except Exception as e:
+    print(f"❌ curl_cffi غير مثبتة! السبب: {e}")
 
-async def send_stats(bot, chat_id: int, message_id: int = None):
-    stats = db.get_stats()
-    text = build_stats_text(stats)
-    if message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=stats_keyboard(),
-                parse_mode=ParseMode.HTML,
-            )
-        except BadRequest as e:
-            if "not modified" not in str(e).lower():
-                logger.warning("فشل تحديث رسالة الإحصائيات: %s", e)
-        return
-    await bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=stats_keyboard(), parse_mode=ParseMode.HTML
-    )
+# تثبيت/تحديث Deno تلقائياً - تيك توك يطلب حل تحدي جافاسكريبت (JS challenge)
+try:
+    deno_check = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if deno_check.returncode != 0:
+        raise FileNotFoundError
+    print("✅ Deno متوفر بالفعل.")
+except Exception:
+    try:
+        print("🔄 Deno غير موجود، جاري تثبيته...")
+        subprocess.run(
+            "curl -fsSL https://deno.land/install.sh | sh -s -- -y",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+        )
+        deno_bin = os.path.expanduser("~/.deno/bin")
+        os.environ["PATH"] = deno_bin + os.pathsep + os.environ.get("PATH", "")
+        print("✅ تم تثبيت Deno.")
+    except Exception as e:
+        print(f"⚠️ تعذر تثبيت Deno تلقائياً: {e}")
 
+# ================== سيرفر الصحة لإرضاء المنصة (Render) ==================
+class DummyHealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Vdy_Bot is Running!")
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.username or "", user.language_code or "")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-    name = user.first_name or "صديقنا"
-    subscribed = await is_subscribed(context.bot, user.id)
-
-    if not subscribed:
-        await update.message.reply_text(force_sub_text(name), reply_markup=subscribe_keyboard())
+    def log_message(self, format, *args):
         return
 
-    await update.message.reply_text(welcome_text(name), reply_markup=main_menu_keyboard())
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), DummyHealthCheckHandler)
+    server.serve_forever()
 
+threading.Thread(target=start_dummy_server, daemon=True).start()
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = update.effective_user
-    data = query.data or ""
-    name = user.first_name or "صديقنا"
+# ================== الإعدادات والتكوين ==================
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger("Vdy_Bot")
 
-    db.touch_user(user.id)
+from collections import deque
+RECENT_ERRORS = deque(maxlen=40)
 
-    if data == "check_sub":
-        subscribed = await is_subscribed(context.bot, user.id)
-        if not subscribed:
-            await query.answer("لم تشترك في القناة بعد ❌", show_alert=True)
-            return
-        await query.answer("تم التحقق بنجاح ✅", show_alert=True)
+class _ErrorCaptureHandler(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            try:
+                msg = self.format(record)
+                RECENT_ERRORS.append(f"{datetime.now().strftime('%H:%M:%S')} - {msg[:800]}")
+            except Exception:
+                pass
+
+_error_handler = _ErrorCaptureHandler()
+_error_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger().addHandler(_error_handler)
+
+TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL = "@ZenoX_Tools"
+ADMIN_ID = 6043858925
+
+COOKIES_FILE = "/etc/secrets/cookies.txt"
+COOKIES_FILE = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+
+PROXY_URL = os.environ.get("PROXY_URL")
+if PROXY_URL:
+    print("🌐 تم العثور على إعدادات بروكسي، سيتم توجيه الطلبات عبره.")
+else:
+    print("ℹ️ لا يوجد بروكسي مُعرّف حالياً (اختياري).")
+
+# ================== ضبط التزامن - عشان البوت ما يعلق ولا يتجاوز الذاكرة ==================
+MAX_CONCURRENT_DOWNLOADS = 1
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
+
+MAX_QUEUE_SIZE = 6
+_pending_downloads = 0
+_pending_lock = asyncio.Lock()
+
+import concurrent.futures
+BLOCKING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="vdy-worker")
+
+async def run_blocking(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(BLOCKING_EXECUTOR, func, *args)
+
+# ================== نظام الإحصائيات ==================
+STATS_FILE = "stats.json"
+
+def load_stats():
+    if os.path.exists(STATS_FILE):
         try:
-            await query.edit_message_text(welcome_text(name), reply_markup=main_menu_keyboard())
-        except BadRequest:
-            await context.bot.send_message(
-                chat_id=user.id, text=welcome_text(name), reply_markup=main_menu_keyboard()
-            )
-        return
-
-    if user.id != config.ADMIN_ID and not await is_subscribed(context.bot, user.id):
-        await query.answer("يجب الاشتراك في القناة أولاً ❌", show_alert=True)
-        try:
-            await query.edit_message_text(force_sub_text(name), reply_markup=subscribe_keyboard())
-        except BadRequest:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data.setdefault("users", {})
+            data.setdefault("total_requests", 0)
+            data.setdefault("successful_downloads", 0)
+            data.setdefault("failed_downloads", 0)
+            data.setdefault("rejected_non_tiktok", 0)
+            data.setdefault("success_via_tikwm", 0)
+            data.setdefault("success_via_heavy_path", 0)
+            data.setdefault("heavy_path_attempts", 0)
+            return data
+        except Exception:
             pass
-        return
+    return {
+        "users": {},
+        "total_requests": 0,
+        "successful_downloads": 0,
+        "failed_downloads": 0,
+        "rejected_non_tiktok": 0,
+        "success_via_tikwm": 0,
+        "success_via_heavy_path": 0,
+        "heavy_path_attempts": 0
+    }
 
-    if data == "admin_stats_refresh":
-        if user.id != config.ADMIN_ID:
-            await query.answer("هذا الأمر للأدمن فقط ❌", show_alert=True)
-            return
-        await query.answer("تم التحديث 🔄")
-        await send_stats(context.bot, query.message.chat_id, query.message.message_id)
-        return
+stats = load_stats()
+BOT_START_TIME = datetime.now()
 
-    await query.answer()
-
-    if data == "back_main":
-        db.set_stt_mode(user.id, False)
-        await query.edit_message_text(welcome_text(name), reply_markup=main_menu_keyboard())
-        return
-
-    if data == "menu_tts":
-        db.set_stt_mode(user.id, False)
-        await query.edit_message_text(
-            "أختر قائمة الأصوات للحصول على الصوت المُناسب 🔊\n"
-            "أو الأصوات المُفضلة إذا كان لديك صوتً محفوضً 💙",
-            reply_markup=tts_submenu_keyboard(),
-        )
-        return
-
-    if data == "menu_stt":
-        db.set_stt_mode(user.id, True)
-        await query.edit_message_text(
-            "تم تفعيل ميزة تحويل الصوت إلى نص ✅\n"
-            "أرسل ملفك الصوتي بصيغة MP3 أو كملاحظة صوتية 🎙️",
-            reply_markup=back_main_keyboard(),
-        )
-        return
-
-    if data == "menu_voices":
-        favs = set(db.get_favorites(user.id))
-        await query.edit_message_text(
-            "🔊 قائمة الأصوات المتوفّرة — اضغط على الصوت لتفعيله، أو على القلب لإضافته للمفضلة:",
-            reply_markup=voices_list_keyboard(0, favs),
-        )
-        return
-
-    if data == "menu_fav":
-        fav_ids = db.get_favorites(user.id)
-        if not fav_ids:
-            await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=back_main_keyboard())
-            return
-        await query.edit_message_text(
-            "💙 قائمة أصواتك المفضّلة:", reply_markup=favorites_list_keyboard(0, fav_ids)
-        )
-        return
-
-    if data.startswith("vlist:"):
-        page = int(data.split(":")[1])
-        favs = set(db.get_favorites(user.id))
-        await query.edit_message_text(
-            "🔊 قائمة الأصوات المتوفّرة — اضغط على الصوت لتفعيله، أو على القلب لإضافته للمفضلة:",
-            reply_markup=voices_list_keyboard(page, favs),
-        )
-        return
-
-    if data.startswith("vfav:"):
-        page = int(data.split(":")[1])
-        fav_ids = db.get_favorites(user.id)
-        await query.edit_message_text(
-            "💙 قائمة أصواتك المفضّلة:", reply_markup=favorites_list_keyboard(page, fav_ids)
-        )
-        return
-
-    if data.startswith("vsel:"):
-        _, origin, page, voice_id = data.split(":", 3)
-        voice = get_voice(voice_id)
-        if not voice:
-            await query.answer("هذا الصوت لم يعد متوفراً", show_alert=True)
-            return
-        db.set_selected_voice(user.id, voice_id)
-        await query.answer(f"تم اختيار الصوت: {voice['name']} {voice['emoji']} ✅")
-        favs = set(db.get_favorites(user.id))
-        header = (
-            f"✅ الصوت الحالي: {voice['emoji']} {voice['name']}\n"
-            "أرسل الآن النص الذي تريد تحويله إلى صوت ✍️\n\n"
-            "أو اختر صوتاً آخر من القائمة:"
-        )
-        if origin == "fav":
-            fav_ids = db.get_favorites(user.id)
-            await query.edit_message_text(header, reply_markup=favorites_list_keyboard(int(page), fav_ids))
-        else:
-            await query.edit_message_text(header, reply_markup=voices_list_keyboard(int(page), favs))
-        return
-
-    if data.startswith("vtog:"):
-        _, origin, page, voice_id = data.split(":", 3)
-        now_fav = db.toggle_favorite(user.id, voice_id)
-        await query.answer("أُضيف للمفضلة 💙" if now_fav else "أُزيل من المفضلة")
-
-        page = int(page)
-        if origin == "fav":
-            fav_ids = db.get_favorites(user.id)
-            if page > 0 and page * config.VOICES_PER_PAGE >= len(fav_ids):
-                page -= 1
-            if not fav_ids:
-                await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=back_main_keyboard())
-                return
-            await query.edit_message_reply_markup(reply_markup=favorites_list_keyboard(page, fav_ids))
-        else:
-            favs = set(db.get_favorites(user.id))
-            await query.edit_message_reply_markup(reply_markup=voices_list_keyboard(page, favs))
-        return
-
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = (update.message.text or "").strip()
-    db.upsert_user(user.id, user.username or "", user.language_code or "")
-    db.touch_user(user.id)
-
-    if user.id == config.ADMIN_ID:
-        if context.user_data.get("awaiting_broadcast"):
-            context.user_data["awaiting_broadcast"] = False
-            await do_broadcast(context.bot, user.id, update.message)
-            return
-
-        if text in ("إحصائيات", "احصائيات"):
-            await send_stats(context.bot, user.id)
-            return
-
-        if text in ("إذاعة", "اذاعة"):
-            context.user_data["awaiting_broadcast"] = True
-            await update.message.reply_text(
-                "📡 تم تفعيل وضع الإذاعة.\nأرسل الآن المنشور (نص أو صورة أو أي رسالة) الذي تريد إرساله لجميع المستخدمين."
-            )
-            return
-
-    name = user.first_name or "صديقنا"
-    if not await is_subscribed(context.bot, user.id):
-        await update.message.reply_text(force_sub_text(name), reply_markup=subscribe_keyboard())
-        return
-
-    voice_id = db.get_selected_voice(user.id)
-    voice = get_voice(voice_id) if voice_id else None
-    if not voice:
-        await update.message.reply_text(
-            "الرجاء اختيار صوت أولاً من قائمة الأصوات 🔊", reply_markup=main_menu_keyboard()
-        )
-        return
-
-    now = time.time()
-    last = _last_request_time.get(user.id, 0)
-    if now - last < config.PER_USER_COOLDOWN_SECONDS:
-        await update.message.reply_text("⏳ الرجاء الانتظار قليلاً قبل إرسال طلب جديد.")
-        return
-    _last_request_time[user.id] = now
-
-    if len(text) == 0:
-        return
-    if len(text) > config.MAX_TEXT_LENGTH:
-        await update.message.reply_text(
-            f"⚠️ النص طويل جداً، الحد الأقصى المسموح به {config.MAX_TEXT_LENGTH} حرف."
-        )
-        return
-
-    await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.RECORD_VOICE)
-
-    success = False
+def save_stats():
     try:
-        async with tts_semaphore:
-            audio_bytes = await generate_speech(text, voice["id"])
-        if not audio_bytes:
-            raise RuntimeError("empty audio")
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "vone_tts.mp3"
-        await context.bot.send_audio(
-            chat_id=user.id,
-            audio=audio_file,
-            title=voice["name"],
-            performer="VONE",
-        )
-        success = True
-    except Exception as e:
-        logger.exception("فشل توليد الصوت: %s", e)
-        await update.message.reply_text("❌ حدث خطأ أثناء تحويل النص إلى صوت، حاول مرة أخرى.")
-    finally:
-        db.log_request(user.id, success)
+def track_user_activity(user_id):
+    stats["users"][str(user_id)] = datetime.now().isoformat()
+    save_stats()
 
+def track_request():
+    stats["total_requests"] += 1
+    save_stats()
 
-async def generate_speech(text: str, voice_id: str) -> bytes:
-    communicate = edge_tts.Communicate(text, voice_id)
-    chunks = bytearray()
-    async for chunk in communicate.stream():
-        if chunk.get("type") == "audio":
-            chunks.extend(chunk["data"])
-    return bytes(chunks)
+def track_result(success: bool):
+    if success:
+        stats["successful_downloads"] += 1
+    else:
+        stats["failed_downloads"] += 1
+    save_stats()
 
+def track_rejected():
+    stats["rejected_non_tiktok"] += 1
+    save_stats()
 
-# ------------------------------------------------------------------
-# تحويل الصوت إلى نص (faster-whisper — يعمل محلياً على السيرفر)
-# ------------------------------------------------------------------
+def track_tikwm_success():
+    """يسجل نجاح عن طريق TikWM (المسار الخفيف السريع)."""
+    stats["success_via_tikwm"] += 1
+    save_stats()
 
-def _get_stt_model():
-    global _stt_model
-    if _stt_model is None:
-        from faster_whisper import WhisperModel
-        _stt_model = WhisperModel(config.STT_MODEL_SIZE, device="cpu", compute_type="int8")
-    return _stt_model
+def track_heavy_path_attempt():
+    """يسجل كل مرة نضطر نلجأ فيها للمسار الثقيل (yt-dlp + curl_cffi + Deno) بعد فشل TikWM."""
+    stats["heavy_path_attempts"] += 1
+    save_stats()
 
+def track_heavy_path_success():
+    """يسجل نجاح فعلي عن طريق المسار الثقيل تحديداً - عشان نعرف هل يستاهل نضحي بالاستقرار عشانه."""
+    stats["success_via_heavy_path"] += 1
+    save_stats()
 
-def _transcribe_audio(audio_bytes: bytes) -> str:
-    model = _get_stt_model()
-    segments, _info = model.transcribe(io.BytesIO(audio_bytes), language="ar", beam_size=1)
-    return " ".join(seg.text.strip() for seg in segments).strip()
-
-
-async def stt_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.username or "", user.language_code or "")
-    db.touch_user(user.id)
-
-    name = user.first_name or "صديقنا"
-    if not await is_subscribed(context.bot, user.id):
-        await update.message.reply_text(force_sub_text(name), reply_markup=subscribe_keyboard())
-        return
-
-    if not db.is_awaiting_stt(user.id):
-        return  # الملف الصوتي مو بسياق هالميزة، نتجاهله بهدوء
-
-    now = time.time()
-    last = _last_stt_time.get(user.id, 0)
-    if now - last < config.STT_COOLDOWN_SECONDS:
-        await update.message.reply_text("⏳ الرجاء الانتظار قليلاً قبل إرسال ملف صوتي جديد.")
-        return
-    _last_stt_time[user.id] = now
-
-    media = update.message.voice or update.message.audio
-    if not media:
-        return
-
-    duration = getattr(media, "duration", 0) or 0
-    if duration > config.MAX_AUDIO_DURATION_SECONDS:
-        await update.message.reply_text(
-            f"⚠️ الملف الصوتي طويل جداً، الحد الأقصى المسموح به {config.MAX_AUDIO_DURATION_SECONDS // 60} دقائق."
-        )
-        return
-
-    await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
-
-    success = False
+# ================== إدارة الاشتراك الإجباري (نفس منطق ZenDown) ==================
+async def check_user_subscription(bot, user_id: int) -> bool:
+    if user_id == ADMIN_ID: return True
     try:
-        tg_file = await context.bot.get_file(media.file_id)
-        input_bytes = bytes(await tg_file.download_as_bytearray())
+        member = await bot.get_chat_member(chat_id=CHANNEL, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
 
-        async with stt_semaphore:
-            text = await asyncio.wait_for(
-                asyncio.to_thread(_transcribe_audio, input_bytes), timeout=120
-            )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user: return
+    track_user_activity(user.id)
 
-        if not text:
-            await update.message.reply_text("❌ لم أتمكن من التعرف على أي كلام بالملف الصوتي.")
-        else:
-            await update.message.reply_text(
-                f"تم التحويل بنجاح ✅\n\n<code>{text}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        success = True
-    except asyncio.TimeoutError:
-        await update.message.reply_text("❌ استغرقت المعالجة وقتاً طويلاً جداً، حاول بملف أقصر.")
-    except Exception as e:
-        logger.exception("فشل تحويل الصوت إلى نص: %s", e)
-        await update.message.reply_text("❌ حدث خطأ أثناء تحويل الصوت إلى نص، حاول مرة أخرى.")
-    finally:
-        db.log_request(user.id, success)
+    if not await check_user_subscription(context.bot, user.id):
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("اشترك في القناة 📡", url=f"https://t.me/{CHANNEL.lstrip('@')}", style="primary")],
+            [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="success")]
+        ])
+        await update.message.reply_text("🚧 عذراً، يجب الاشتراك بالقناة أولاً لاستخدام البوت.", reply_markup=markup)
+        return
 
+    await update.message.reply_text(
+        f"أهلاً بك <b>{user.first_name}</b> في @Vdy_bot! 🎵\n"
+        "أرسل رابط فيديو تيك توك وبيوصلك فوراً بدون أي خطوات إضافية.",
+        parse_mode="HTML"
+    )
 
-async def do_broadcast(bot, admin_id: int, source_message):
-    user_ids = db.get_all_user_ids()
-    await bot.send_message(admin_id, f"📡 جارٍ إرسال الإذاعة إلى {len(user_ids)} مستخدم بهدوء...")
-
-    sent, failed = 0, 0
-    for uid in user_ids:
-        if uid == admin_id:
-            continue
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if await check_user_subscription(context.bot, q.from_user.id):
         try:
-            await bot.copy_message(
-                chat_id=uid,
-                from_chat_id=source_message.chat_id,
-                message_id=source_message.message_id,
-            )
-            sent += 1
-        except Forbidden:
-            db.remove_user(uid)
-            failed += 1
-        except Exception as e:
-            logger.warning("فشل إرسال الإذاعة للمستخدم %s: %s", uid, e)
-            failed += 1
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_text("✅ تم التحقق! أرسل رابط فيديو تيك توك الآن.")
+    else:
+        await q.answer("❌ لم تشترك بالقناة بعد!", show_alert=True)
 
-        await asyncio.sleep(config.BROADCAST_DELAY_SECONDS)
+# ================== لوحة الأخطاء (للأدمن) ==================
+async def show_errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    if not RECENT_ERRORS:
+        await update.message.reply_text("✅ ما فيه أي أخطاء مسجلة منذ آخر تشغيل للبوت.")
+        return
+    text = "🛑 <b>آخر الأخطاء المسجلة</b>\n━━━━━━━\n\n"
+    for i, err in enumerate(reversed(RECENT_ERRORS), 1):
+        safe_err = err.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text += f"{i}. <code>{safe_err}</code>\n\n"
+        if len(text) > 3500:
+            text += "... (يوجد المزيد)"
+            break
+    await update.message.reply_text(text, parse_mode="HTML")
 
-    await bot.send_message(
-        admin_id, f"✅ انتهت الإذاعة\n\nنجح الإرسال: {sent}\nفشل الإرسال: {failed}"
+# ================== لوحة الإحصائيات (للأدمن) ==================
+async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID: return
+
+    msg = update.callback_query.message if update.callback_query else update.message
+    now = datetime.now()
+
+    total_users = len(stats["users"])
+    active_today = active_7d = active_30d = 0
+    for uid, last_str in stats["users"].items():
+        try:
+            diff = now - datetime.fromisoformat(last_str)
+            if diff <= timedelta(days=1): active_today += 1
+            if diff <= timedelta(days=7): active_7d += 1
+            if diff <= timedelta(days=30): active_30d += 1
+        except Exception:
+            pass
+
+    total_req = stats.get("total_requests", 0)
+    success = stats.get("successful_downloads", 0)
+    failed = stats.get("failed_downloads", 0)
+    rejected = stats.get("rejected_non_tiktok", 0)
+    tikwm_ok = stats.get("success_via_tikwm", 0)
+    heavy_attempts = stats.get("heavy_path_attempts", 0)
+    heavy_ok = stats.get("success_via_heavy_path", 0)
+    total_dl = success + failed
+    rate = (success / total_dl * 100) if total_dl > 0 else 0.0
+    tikwm_share = (tikwm_ok / success * 100) if success > 0 else 0.0
+
+    uptime = now - BOT_START_TIME
+    days = uptime.days
+    hours = uptime.seconds // 3600
+    minutes = (uptime.seconds // 60) % 60
+
+    stats_msg = (
+        "📊 <b>لوحة إحصائيات @Vdy_bot (تيك توك)</b>\n"
+        "━━━━━━━\n\n"
+        "👥 <b>المستخدمون</b>\n"
+        "───────────────\n"
+        f"📌 الإجمالي       : {total_users}\n"
+        f"🟢 نشطون (اليوم)  : {active_today}\n"
+        f"📅 نشطون (7 أيام) : {active_7d}\n"
+        f"🗓 نشطون (30 يوم) : {active_30d}\n"
+        "───────────────\n\n"
+        "🎵 <b>تحميلات تيك توك</b>\n"
+        "───────────────\n"
+        f"🔢 إجمالي الطلبات : {total_req}\n"
+        f"✅ ناجحة         : {success}\n"
+        f"❌ فاشلة         : {failed}\n"
+        f"✅ معدل النجاح    : {rate:.1f}%\n"
+        f"🚫 روابط مرفوضة (غير تيك توك) : {rejected}\n"
+        "───────────────\n\n"
+        "⚖️ <b>TikWM مقابل المسار الثقيل</b>\n"
+        "───────────────\n"
+        f"⚡️ نجاح عبر TikWM (الخفيف) : {tikwm_ok} ({tikwm_share:.1f}% من كل النجاح)\n"
+        f"🐢 محاولات لجأت للمسار الثقيل : {heavy_attempts}\n"
+        f"✅ نجاح فعلي بالمسار الثقيل : {heavy_ok}\n"
+        "───────────────\n\n"
+        f"⏰ <b>وقت التشغيل:</b> {days} يوم {hours} ساعة {minutes} دقيقة"
     )
 
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("تحديث 🔄", callback_data="refresh_stats", style="primary")]])
+    if update.callback_query:
+        await update.callback_query.answer("تم التحديث 🔄")
+        try:
+            await msg.edit_text(stats_msg, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+    else:
+        await msg.reply_text(stats_msg, parse_mode="HTML", reply_markup=markup)
 
-async def post_init(application: Application):
-    await application.bot.set_my_commands([BotCommand("start", "بدء استخدام البوت")])
-    # نحمّل نموذج تحويل الصوت إلى نص عند تشغيل البوت (مو أول ما يوصل أول ملف)
+# ================== الإذاعة (للأدمن) ==================
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = update.message.text.replace("/broadcast", "").strip()
+    if not text:
+        await update.message.reply_text("الرجاء كتابة الرسالة بعد الأمر، مثال:\n/broadcast مرحباً بالجميع!")
+        return
+    users = list(stats["users"].keys())
+    if not users:
+        await update.message.reply_text("❌ لا يوجد مستخدمين مسجلين.")
+        return
+    msg = await update.message.reply_text(f"🚀 جاري الإرسال إلى {len(users)} مستخدم...")
+    success = failed = 0
+    for uid in users:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await msg.edit_text(f"✅ تمت الإذاعة!\n\n- نجح: {success}\n- فشل: {failed}")
+
+# ================== منطق التحميل من تيك توك ==================
+def _get_urllib_opener():
+    if PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler({'http': PROXY_URL, 'https': PROXY_URL})
+        return urllib.request.build_opener(proxy_handler)
+    return urllib.request.build_opener()
+
+def _blocking_tiktok_via_tikwm(url, out_path):
+    """مسار سريع: يجيب رابط التحميل المباشر من خدمة TikWM الوسيطة، أسرع من yt-dlp غالباً."""
+    opener = _get_urllib_opener()
+    api_url = "https://www.tikwm.com/api/?url=" + urllib.request.quote(url, safe="")
+    req = urllib.request.Request(api_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://www.tikwm.com/',
+        'Accept': 'application/json, text/plain, */*'
+    })
     try:
-        await asyncio.to_thread(_get_stt_model)
-        logger.info("تم تحميل نموذج تحويل الصوت إلى نص بنجاح.")
+        with opener.open(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise Exception(f"HTTP {e.code} من TikWM")
+
+    if data.get("code") != 0 or "data" not in data:
+        raise Exception(f"TikWM API error: {data.get('msg', 'unknown')}")
+
+    media_url = data["data"].get("play") or data["data"].get("hdplay")
+    if not media_url:
+        raise Exception("TikWM: لا يوجد رابط فيديو بالرد")
+    if media_url.startswith("/"):
+        media_url = "https://www.tikwm.com" + media_url
+
+    dl_req = urllib.request.Request(media_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://www.tikwm.com/'
+    })
+    with urllib.request.urlopen(dl_req, timeout=60) as resp, open(out_path, "wb") as f:
+        f.write(resp.read())
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    raise Exception("TikWM: الملف الناتج فارغ")
+
+def _blocking_download_yt_dlp(url, out_path):
+    """المسار الاحتياطي: yt-dlp + curl_cffi (انتحال بصمة) + Deno (حل تحدي جافاسكريبت)."""
+    opts = {
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': out_path,
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIES_FILE,
+        'proxy': PROXY_URL,
+        'extractor_args': {'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}},
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 20,
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+def _blocking_upload_to_external_host(file_path):
+    """لو الفيديو أكبر من حد تليجرام (50 ميجا) - يرفعه لرابط تحميل مباشر بدل ما يفشل."""
+    import mimetypes
+    filename = os.path.basename(file_path)
+    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    with open(file_path, 'rb') as f:
+        file_bytes = f.read()
+    boundary = uuid.uuid4().hex
+
+    def _body(fields, file_field_name):
+        parts = []
+        for name, value in fields.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field_name}"; filename="{filename}"\r\n'
+            f'Content-Type: {mime_type}\r\n\r\n'.encode() + file_bytes + b'\r\n'
+        )
+        parts.append(f'--{boundary}--\r\n'.encode())
+        return b''.join(parts)
+
+    try:
+        body = _body({'reqtype': 'fileupload'}, 'fileToUpload')
+        req = urllib.request.Request("https://catbox.moe/user/api.php", data=body,
+                                      headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result_url = resp.read().decode().strip()
+            if result_url.startswith('http'):
+                return result_url
     except Exception as e:
-        logger.warning("فشل تحميل نموذج تحويل الصوت إلى نص مسبقاً: %s", e)
+        logger.error(f"External host (catbox) failed: {e}")
 
+    try:
+        body = _body({}, 'file')
+        req = urllib.request.Request("https://0x0.st", data=body, headers={
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        })
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result_url = resp.read().decode().strip()
+            if result_url.startswith('http'):
+                return result_url
+    except Exception as e:
+        logger.error(f"External host (0x0.st) failed: {e}")
 
+    raise Exception("فشلت كل خدمات الاستضافة الاحتياطية")
+
+def _is_tiktok_url(url: str) -> bool:
+    return "tiktok.com" in url.lower()
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user: return
+    track_user_activity(user.id)
+
+    if not await check_user_subscription(context.bot, user.id):
+        await update.message.reply_text("🚧 يرجى الاشتراك في القناة أولاً.")
+        return
+
+    text = update.message.text.strip()
+
+    if not text.startswith("http"):
+        await update.message.reply_text("أرسل رابط فيديو تيك توك بس 🙏")
+        return
+
+    # فحص سريع فوري (بدون أي اتصال إنترنت) - قبل أي معالجة ثقيلة
+    if not _is_tiktok_url(text):
+        track_rejected()
+        await update.message.reply_text("عذراً أرسل رابط فيديو تيك توك.. لتحميل هذا الفيديو استخدم بوت @ZenDown_Bot")
+        return
+
+    track_request()
+
+    # فحص الزحمة - لو الطابور ممتلئ، رفض فوري بدل انتظار بلا نهاية
+    global _pending_downloads
+    async with _pending_lock:
+        if _pending_downloads >= MAX_QUEUE_SIZE:
+            await update.message.reply_text("🚧 البوت مزدحم جداً حالياً.\nحاول مرة ثانية بعد كم دقيقة 🙏")
+            return
+        _pending_downloads += 1
+
+    status_msg = await update.message.reply_text("⏳ جاري التحميل...")
+    sid = uuid.uuid4().hex[:8]
+    file_path = None
+    success = False
+
+    try:
+        async with DOWNLOAD_SEMAPHORE:
+            # المسار الأول: TikWM (أسرع، خفيف على الذاكرة)
+            try:
+                tikwm_out = f"vdy_{sid}_tikwm.mp4"
+                file_path = await asyncio.wait_for(run_blocking(_blocking_tiktok_via_tikwm, text, tikwm_out), timeout=60)
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    success = True
+                    track_tikwm_success()
+            except asyncio.TimeoutError:
+                logger.error("TikWM timed out after 60s")
+                file_path = None
+            except Exception as e:
+                logger.error(f"TikWM failed: {e}")
+                file_path = None
+
+            # المسار الاحتياطي: yt-dlp + curl_cffi + Deno
+            if not success:
+                track_heavy_path_attempt()
+                for attempt in range(3):
+                    try:
+                        yt_out = f"vdy_{sid}.%(ext)s"
+                        file_path = await asyncio.wait_for(run_blocking(_blocking_download_yt_dlp, text, yt_out), timeout=90)
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                            success = True
+                            track_heavy_path_success()
+                            break
+                    except asyncio.TimeoutError:
+                        logger.error(f"Attempt {attempt + 1} timed out after 90s")
+                    except Exception as e:
+                        logger.error(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+
+        if success and file_path and os.path.exists(file_path):
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if size_mb >= 49.5:
+                await status_msg.edit_text("📦 المقطع كبير، جاري رفعه لرابط تحميل مباشر...")
+                try:
+                    async with UPLOAD_SEMAPHORE:
+                        external_url = await run_blocking(_blocking_upload_to_external_host, file_path)
+                    await update.message.reply_text(f"✅ المقطع كبير ({size_mb:.1f} ميجا)، حمّله من هنا:\n{external_url}")
+                    track_result(True)
+                    await status_msg.delete()
+                except Exception as e:
+                    logger.error(f"External upload failed: {e}")
+                    await status_msg.edit_text("❌ تعذر رفع المقطع الكبير حالياً، حاول لاحقاً.")
+                    track_result(False)
+            else:
+                await status_msg.edit_text("📤 جاري الإرسال...")
+                with open(file_path, 'rb') as f:
+                    await update.message.reply_video(video=f, caption="🎬 تم بواسطة @Vdy_bot", supports_streaming=True)
+                track_result(True)
+                await status_msg.delete()
+        else:
+            track_result(False)
+            await status_msg.edit_text("❌ تعذر تحميل هذا المقطع، جرب رابط ثاني أو حاول لاحقاً.")
+    except Exception as e:
+        logger.error(f"Unhandled error: {e}")
+        track_result(False)
+        try:
+            await status_msg.edit_text("❌ حدث خطأ غير متوقع.")
+        except Exception:
+            pass
+    finally:
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except Exception: pass
+        async with _pending_lock:
+            _pending_downloads -= 1
+
+# ================== معالج الأخطاء العام ==================
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    tb_string = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    logger.error(f"استثناء غير متوقع (Unhandled): {context.error}\n{tb_string[-1500:]}")
+
+# ================== حارس الذاكرة ==================
+async def _memory_watchdog():
+    THRESHOLD_MB = 400
+    while True:
+        await asyncio.sleep(15)
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        rss_mb = int(line.split()[1]) / 1024
+                        if rss_mb >= THRESHOLD_MB:
+                            logger.error(f"Memory watchdog: {rss_mb:.0f}MB تجاوزت الحد - إعادة تشغيل منظمة.")
+                            os._exit(0)
+                        break
+        except Exception as e:
+            logger.error(f"Memory watchdog check failed: {e}")
+
+async def _post_init(application):
+    asyncio.create_task(_memory_watchdog())
+
+# ================== التشغيل الرئيسي ==================
 def main():
-    if not config.BOT_TOKEN:
-        raise RuntimeError("متغيّر البيئة BOT_TOKEN غير موجود. أضفه من إعدادات Render.")
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
+    app.add_error_handler(global_error_handler)
 
-    db.init_db()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("stats", show_stats_command))
+    app.add_handler(CommandHandler("errors", show_errors_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(احصائيات|إحصائيات)$"), show_stats_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(اخطاء|أخطاء)$"), show_errors_command))
+    app.add_handler(CallbackQueryHandler(show_stats_command, pattern="^refresh_stats$"))
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    threading.Thread(target=run_server, daemon=True).start()
-
-    application = (
-        ApplicationBuilder()
-        .token(config.BOT_TOKEN)
-        .post_init(post_init)
-        .concurrent_updates(True)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CallbackQueryHandler(callback_router))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, stt_router))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    logger.info("VONE bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    print("🚀 تم تشغيل محرك @Vdy_bot بنجاح! مخصص لتيك توك فقط.")
+    app.run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
