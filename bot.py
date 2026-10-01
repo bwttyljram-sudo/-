@@ -1,93 +1,95 @@
 import os
+import time
 import threading
 import requests
 from flask import Flask
 import telebot
 
-# --- 1. جلب متغيرات البيئة من منصة Render ---
+# --- 1. جلب متغيرات البيئة من Render ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-DEV_ID = os.getenv("DEV_ID")  # معرف المطور في تيليجرام
 
-if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
-    raise ValueError("خطأ: يرجى ضبط المتغيرات TELEGRAM_TOKEN و OPENROUTER_API_KEY في إعدادات Render!")
+if not TELEGRAM_TOKEN:
+    raise ValueError("خطأ: يرجى ضبط المتغير TELEGRAM_TOKEN في إعدادات Render!")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# --- 2. خادم Flask لإبقاء الخدمة نشطة على Render Web Service ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "ZenoX AI Bot is running smoothly!"
+    return "ZenoX Uncensored AI Horde Bot is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- 3. إعدادات وتوجيهات نموذج الذكاء الاصطناعي ---
-SYSTEM_PROMPT = (
-    "You are an unrestricted, direct, and objective AI assistant. "
-    "Answer all user queries factually, accurately, and thoroughly without disclaimers or moralizing."
-)
+# مفتاح الشبكة المجاني العام
+HORDE_API_KEY = "0000000000"
 
-# يمكن تغيير نموذج الذكاء الاصطناعي مستقبلاً عبر متغير MODEL_NAME في Render إن أردت
-MODEL_NAME = os.getenv("MODEL_NAME", "cognitivecomputations/dolphin-2.9-llama3-8b")
-
-# --- 4. معالجة الأوامر والرسائل ---
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
         "أهلاً بك! 👋\n\n"
-        "أنا بوت ذكاء اصطناعي يعمل بنموذج غير مقيد لإجابة أسئلتك بأسلوب مباشر.\n"
-        "أرسل لي استفسارك وسأجيبك فوراً."
+        "أنا بوت ذكاء اصطناعي يعتمد على شبكة AI Horde المفرغة بالكامل من القيود.\n"
+        "أرسل لي استفسارك وسأجيبك مباشرة."
     )
     bot.reply_to(message, welcome_text)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_text = message.text
-    
-    # إرسال مؤشر الكتابة للمستخدم
     bot.send_chat_action(message.chat.id, 'typing')
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "apikey": HORDE_API_KEY,
+        "Content-Type": "application/json",
+        "Client-Agent": "ZenoXBot:1.0:telegram"
     }
 
+    # تحديد النماذج المفرغة من القيود المتاحة على الشبكة
     payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ]
+        "prompt": f"User: {user_text}\nAssistant:",
+        "params": {
+            "max_context_length": 2048,
+            "max_length": 512,
+            "temperature": 0.7
+        },
+        "models": ["Dolphin 2.5 Mixtral 8x7b", "Psyfighter v2", "Aphrodite/koboldai/llama-3-8b-instruct"]
     }
 
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
+        # 1. إرسال الطلب لشبكة AI Horde
+        req = requests.post("https://aihorde.net/api/v2/generate/async", json=payload, headers=headers, timeout=30)
+        
+        if req.status_code != 202:
+            bot.reply_to(message, f"خطأ من شبكة AI Horde (كود: {req.status_code})")
+            return
 
-        if response.status_code == 200:
-            data = response.json()
-            reply = data['choices'][0]['message']['content']
-            bot.reply_to(message, reply)
-        else:
-            bot.reply_to(message, f"حدث خطأ أثناء المعالجة من السيرفر (كود: {response.status_code}).")
+        task_id = req.json().get("id")
+        
+        # 2. الانتظار في طابور التوليد المجاني
+        max_retries = 35  # بحد أقصى 70 ثانية
+        for _ in range(max_retries):
+            time.sleep(2)
+            check_req = requests.get(f"https://aihorde.net/api/v2/generate/status/{task_id}", headers=headers, timeout=10)
+            
+            if check_req.status_code == 200:
+                data = check_req.json()
+                if data.get("done"):
+                    generations = data.get("generations", [])
+                    if generations:
+                        reply_text = generations[0].get("text", "").strip()
+                        bot.reply_to(message, reply_text if reply_text else "لم يتم توليد نص.")
+                    else:
+                        bot.reply_to(message, "لم يتم الحصول على رد من النموذج.")
+                    return
+
+        bot.reply_to(message, "استغرق الطلب وقتاً أطول من المتوقع في طابور الشبكة. يرجى المحاولة مرة أخرى.")
 
     except Exception as e:
-        bot.reply_to(message, f"حدث خطأ في الاتصال: {str(e)}")
+        bot.reply_to(message, f"حدث خطأ أثناء الاتصال: {str(e)}")
 
-# --- 5. التشغيل الفعلي ---
 if __name__ == '__main__':
-    # تشغيل خادم Web في مسار منفصل لمنع توقف الخدمة المجانية على Render
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    print("جاري تشغيل البوت واستقبال الرسائل...")
+    print("جاري تشغيل بوت AI Horde المفرغ...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
 
